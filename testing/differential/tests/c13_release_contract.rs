@@ -83,26 +83,71 @@ fn the_hosted_extended_populations_are_retained_without_nightly_credit() {
 
 #[test]
 fn a_premature_release_is_mechanically_blocked() {
-    assert!(NIGHTLY.contains("\"status\": \"pending\""));
-    assert!(NIGHTLY.contains("\"release_blocked\": true"));
-    assert_eq!(NIGHTLY.matches("\"qualifies\": true").count(), 4);
+    // The streak completed on 2026-08-30 (7 consecutive qualifying nights, 08-24..08-30,
+    // audited job-by-job), so the live evidence can no longer play the premature fixture.
+    // The completed state is pinned here; the refusal is proven below against a doctored
+    // copy of the workspace — the gate keeps its ability to fail, it is never weakened.
+    assert!(NIGHTLY.contains("\"status\": \"complete\""));
+    assert!(NIGHTLY.contains("\"release_blocked\": false"));
+    assert_eq!(NIGHTLY.matches("\"qualifies\": true").count(), 19);
     assert!(RELEASE.contains("scripts/verify_c13_release.py"));
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
         .expect("workspace root");
-    let output = Command::new("python3")
-        .arg(root.join("scripts/verify_c13_release.py"))
+
+    // The completed 7/7 evidence passes the gate for the frozen candidate tag.
+    let approved = run_release_verifier(root);
+    assert!(
+        approved.status.success(),
+        "the completed 7/7 evidence was refused: {}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+
+    // A workspace copy whose nightly evidence is set back to pending is refused by name.
+    let doctored_root =
+        std::env::temp_dir().join(format!("schweep-c13-premature-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&doctored_root);
+    std::fs::create_dir_all(doctored_root.join("scripts")).expect("doctored scripts dir");
+    std::fs::create_dir_all(doctored_root.join("testing/evidence")).expect("doctored evidence dir");
+    std::fs::copy(root.join("Cargo.toml"), doctored_root.join("Cargo.toml"))
+        .expect("copy workspace manifest");
+    std::fs::copy(
+        root.join("scripts/verify_c13_release.py"),
+        doctored_root.join("scripts/verify_c13_release.py"),
+    )
+    .expect("copy release verifier");
+    let pending = NIGHTLY.replace("\"status\": \"complete\"", "\"status\": \"pending\"");
+    assert_ne!(
+        pending, NIGHTLY,
+        "doctoring the evidence copy changed nothing"
+    );
+    std::fs::write(
+        doctored_root.join("testing/evidence/c13-nightly-streak.json"),
+        pending,
+    )
+    .expect("write doctored evidence");
+
+    let blocked = run_release_verifier(&doctored_root);
+    assert!(
+        !blocked.status.success(),
+        "a pending-evidence release passed its gate"
+    );
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(stderr.contains("nightly evidence is not marked complete"));
+    let _ = std::fs::remove_dir_all(&doctored_root);
+}
+
+fn run_release_verifier(script_root: &std::path::Path) -> std::process::Output {
+    Command::new("python3")
+        .arg(script_root.join("scripts/verify_c13_release.py"))
         .arg("current-v0.1")
         // GitHub sets this to the PR branch. The release workflow intentionally trusts that live tag
         // value, but this test is exercising the explicit candidate argument and must not inherit an
         // unrelated runner ref that changes which fail-closed check fires first.
         .env_remove("GITHUB_REF_NAME")
-        .current_dir(root)
+        .current_dir(script_root)
         .output()
-        .expect("run release verifier");
-    assert!(!output.status.success(), "a 4/7 release passed its gate");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("nightly evidence is not marked complete"));
+        .expect("run release verifier")
 }
